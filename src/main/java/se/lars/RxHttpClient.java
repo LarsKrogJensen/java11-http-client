@@ -15,22 +15,23 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.codahale.metrics.MetricRegistry.name;
-import static java.util.concurrent.ForkJoinPool.commonPool;
 import static se.lars.Json.parse;
 import static se.lars.Json.stringify;
 import static se.lars.JsonBodyHandler.getDecodedInputStream;
 
 public class RxHttpClient {
+    private static final AtomicInteger clientCounter = new AtomicInteger();
     private static final Logger log = LoggerFactory.getLogger(RxHttpClient.class);
 
     private final HttpClient client;
     private final Duration defaultReadTimeout;
+    private static ThreadPoolExecutor dispatchExecutor;
 
     public RxHttpClient(HttpClient client) {
         this(client, Duration.ofSeconds(10));
@@ -42,22 +43,25 @@ public class RxHttpClient {
     }
 
     public static RxHttpClient create(MetricRegistry registry) {
-        // use a customized thread pool that responses will be dispatched on
-        // default is using a cachedThreadPool that doesn't have an proper upper bound for threads
-        // we want to limit threads and and use a queue to mitigate the thread bound
-
+        // Some notes to remember
         // the http client keeps a connection pool where connections are keept alive for 20 minutes
         // - controlled by system property jdk.httpclient.keepalive.timeout
         // - connection pool size (http 1.1) is unbounded controlled by jdk.httpclient.connectionPoolSize
-        ArrayBlockingQueue<Runnable> workQueue = new ArrayBlockingQueue<>(10_000);
-        var executor = new ThreadPoolExecutor(
+
+        int clientId = clientCounter.incrementAndGet();
+
+        // IO executor is used by http client to consume the io stream before dispatching
+        // if not supplied http client will use a cachedThreadPool that doesn't have an proper upper bound for threads
+        // we want to limit threads and and use a queue to mitigate the thread bound
+        var ioWorkQueue = new ArrayBlockingQueue<Runnable>(1_000);
+        var ioExecutor = new ThreadPoolExecutor(
                 Runtime.getRuntime().availableProcessors(),
-                Runtime.getRuntime().availableProcessors() * 4,
+                Runtime.getRuntime().availableProcessors() * 2,
                 60, TimeUnit.SECONDS,
-                workQueue,
-                new DefaultHttpThreadFactory("default"),
+                ioWorkQueue,
+                new DefaultHttpThreadFactory("dispatch-" + clientId),
                 (runnable, executor1) -> {
-                    log.error("Pool and threads exhausted");
+                    log.error("IO Pool and threads exhausted {}", clientId);
                     // this is actually the default behavior but wanted
                     // capture and log
                     throw new RejectedExecutionException("Task " + runnable.toString() +
@@ -66,17 +70,39 @@ public class RxHttpClient {
                 }
         );
 
+        // dispatch executor is used by this wrapper to dispatch completed responses
+        // from the http client and thus a continuation executor.
+        var dispatchWorkQueue = new ArrayBlockingQueue<Runnable>(1_000);
+        dispatchExecutor = new ThreadPoolExecutor(
+                Runtime.getRuntime().availableProcessors(),
+                Runtime.getRuntime().availableProcessors() * 2,
+                60, TimeUnit.SECONDS,
+                dispatchWorkQueue,
+                new DefaultHttpThreadFactory("dispatch-" + clientId),
+                (runnable, executor1) -> {
+                    log.error("Dispatch pool and threads exhausted, client {}", clientId);
+                    // this is actually the default behavior but wanted
+                    // capture and log
+                    throw new RejectedExecutionException("Task " + runnable.toString() +
+                                                         " rejected from " +
+                                                         executor1.toString());
+                }
+        );
 
-        registry.gauge(name("rx_client", "default", "pool", "core_size"), () -> executor::getCorePoolSize);
-        registry.gauge(name("rx_client", "default", "pool", "max_size"), () -> executor::getCorePoolSize);
-        registry.gauge(name("rx_client", "default", "pool", "active_count"), () -> executor::getActiveCount);
-        registry.gauge(name("rx_client", "default", "pool", "size"), () -> executor::getPoolSize);
+        registry.gauge(name("rx_client_" + clientId, "dispatch", "pool", "core_size"), () -> dispatchExecutor::getCorePoolSize);
+        registry.gauge(name("rx_client_" + clientId, "dispatch", "pool", "max_size"), () -> dispatchExecutor::getCorePoolSize);
+        registry.gauge(name("rx_client_" + clientId, "dispatch", "pool", "active_count"), () -> dispatchExecutor::getActiveCount);
+        registry.gauge(name("rx_client_" + clientId, "dispatch", "pool", "size"), () -> dispatchExecutor::getPoolSize);
+        registry.gauge(name("rx_client_" + clientId, "dispatch", "queue", "count"), () -> dispatchWorkQueue::size);
 
-        registry.gauge(name("rx_client", "default", "queue", "count"), () -> workQueue::size);
-
+        registry.gauge(name("rx_client_" + clientId, "io", "pool", "core_size"), () -> ioExecutor::getCorePoolSize);
+        registry.gauge(name("rx_client_" + clientId, "io", "pool", "max_size"), () -> ioExecutor::getCorePoolSize);
+        registry.gauge(name("rx_client_" + clientId, "io", "pool", "active_count"), () -> ioExecutor::getActiveCount);
+        registry.gauge(name("rx_client_" + clientId, "io", "pool", "size"), () -> ioExecutor::getPoolSize);
+        registry.gauge(name("rx_client_" + clientId, "io", "queue", "count"), () -> ioWorkQueue::size);
 
         var client = HttpClient.newBuilder()
-                .executor(executor)
+                .executor(ioExecutor)
                 .connectTimeout(Duration.ofSeconds(3))
                 .build();
 
@@ -140,12 +166,8 @@ public class RxHttpClient {
                                 source.onError(new HttpResponseException(response));
                             }
                         }
-                    }, client.executor().orElse(commonPool())));
-            // client executor is not used for dependent tasks (which is weird, what is the executor for)
-            // https://stackoverflow.com/questions/51907641/java-11-http-client-asynchronous-execution
-            // here we are using the executor configured for the client
+                    }, dispatchExecutor));
         });
-
     }
 
     private void restoreMdc(Map<String, String> mdc) {
